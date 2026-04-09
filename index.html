@@ -664,26 +664,43 @@ window.castVote = function(choice) {
   runTransaction(voteRef, v => (v || 0) + 1);
 };
 
-// ── Game orchestration (run by whoever's tab resolves first) ──────────────────
+// ── Game orchestration (polling loop — every tab runs this) ───────────────────
 let lastState = null;
-let orchestrating = false;
+let orchestrateLoop = null;
 
-async function maybeOrchestrate(state) {
-  if (orchestrating) return;
+function startOrchestrateLoop() {
+  if (orchestrateLoop) return;
+  orchestrateLoop = setInterval(async () => {
+    const state = lastState;
+    if (!state) return;
 
-  // Check if vote window has expired
-  if (state.phase === 'voting' && state.voteEndsAt && Date.now() > state.voteEndsAt + 500) {
-    orchestrating = true;
-    await resolveVote(state);
-    orchestrating = false;
-  }
+    if (state.phase === 'voting' && state.voteEndsAt && Date.now() > state.voteEndsAt + 300) {
+      // Use a Firebase transaction to claim the right to resolve — only one tab wins
+      const lockRef = ref(db, 'blackjack/resolveLock');
+      try {
+        const result = await runTransaction(lockRef, current => {
+          if (current === state.handId) return; // abort — already resolved
+          return state.handId;
+        });
+        if (result.committed) {
+          await resolveVote(state);
+        }
+      } catch(e) { /* another tab got it */ }
+    }
 
-  // Check if we need to start a new hand after result display
-  if (state.phase === 'result' && state.resultAt && Date.now() > state.resultAt + NEW_HAND_DELAY_MS) {
-    orchestrating = true;
-    await startNewHand(state.bankroll, (state.handsPlayed || 0));
-    orchestrating = false;
-  }
+    if (state.phase === 'result' && state.resultAt && Date.now() > state.resultAt + NEW_HAND_DELAY_MS) {
+      const lockRef = ref(db, 'blackjack/newHandLock');
+      try {
+        const result = await runTransaction(lockRef, current => {
+          if (current === state.handId) return; // abort
+          return state.handId;
+        });
+        if (result.committed) {
+          await startNewHand(state.bankroll, state.handsPlayed || 0);
+        }
+      } catch(e) { /* another tab got it */ }
+    }
+  }, 500);
 }
 
 async function resolveVote(state) {
@@ -861,8 +878,8 @@ onValue(gameRef, async snapshot => {
   document.getElementById('online-count').textContent =
     (state.votes?.hit || 0) + (state.votes?.stand || 0) + ' voted this round';
 
-  // Orchestrate next action
-  setTimeout(() => maybeOrchestrate(state), 600);
+  // Start orchestration loop if not already running
+  startOrchestrateLoop();
 });
 </script>
 </body>
